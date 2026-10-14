@@ -1,0 +1,581 @@
+# =============================================================
+#  Biurko elektryczne SHD20 / panel 006F-SA32_V7.0
+#  XIAO ESP32-C6 + BSS138 + ESPHome, lacznosc przez Thread
+#
+#  Skrzynka -> panel  (pin 1 RJ45), 6 bajtow:
+#     5A  D1  D2  D3  01  CHK
+#  Panel -> skrzynka  (pin 2 RJ45), 5 bajtow, ciagle co ~20 ms:
+#     A5  00  KEY  ~KEY  FF
+#     KEY: 0x01 M | 0x02 p1 | 0x04 p2 | 0x08 p3 | 0x20 gora | 0x40 dol
+#
+#  Trzy mechanizmy warte uwagi:
+#
+#  1. IMPULS BUDZACY. Sterownik zasypia po kilkunastu sekundach
+#     i pierwsze naciskniecie zuzywa na wybudzenie. Dlatego kazda
+#     komenda po dluzszej przerwie jest poprzedzona krotkim
+#     impulsem 40 ms i przerwa 250 ms. Impuls jest za krotki,
+#     zeby ruszyc silnikiem.
+#
+#  2. HAMOWANIE PREDYKCYJNE. Petla liczy rzeczywista predkosc
+#     biurka i zatrzymuje z wyprzedzeniem proporcjonalnym do
+#     niej, zamiast czekac az wysokosc zrowna sie z celem.
+#
+#  3. WATCHDOG. Komenda jazdy jest odswiezana na 80 ms do przodu.
+#     Jesli petla przestanie dzialac, injekcja wygasa i biurko
+#     staje samo.
+# =============================================================
+
+substitutions:
+  device_name: biurko
+  pin_dis_tx: GPIO0
+  pin_to_panel: GPIO1
+  pin_from_panel: GPIO2
+  pin_to_box: GPIO21
+
+esphome:
+  name: ${device_name}
+  friendly_name: Biurko
+
+esp32:
+  variant: esp32c6
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+network:
+  enable_ipv6: true
+
+openthread:
+  device_type: FTD
+  tlv: !secret thread_tlv
+  force_dataset: true
+
+logger:
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_key_biurko
+
+ota:
+  - platform: esphome
+
+uart:
+  - id: uart_display
+    rx_pin: ${pin_dis_tx}
+    tx_pin: ${pin_to_panel}
+    baud_rate: 9600
+    rx_buffer_size: 512
+
+  - id: uart_box
+    rx_pin: ${pin_from_panel}
+    tx_pin: ${pin_to_box}
+    baud_rate: 9600
+    rx_buffer_size: 512
+
+globals:
+  - id: rx_buf
+    type: std::vector<uint8_t>
+    restore_value: no
+
+  - id: height_val
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # ---- silnik injekcji ----
+  - id: inject_key
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: inject_left
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # ile cykli 10 ms bez zadnej injekcji - do wykrycia uspienia
+  - id: idle_ticks
+    type: int
+    restore_value: no
+    initial_value: '9999'
+
+  # przerwa po impulsie budzacym
+  - id: wake_gap
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # komenda czekajaca na wyslanie po wybudzeniu
+  - id: pend_key
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: pend_left
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # ---- regulacja ----
+  - id: target_h
+    type: float
+    restore_value: no
+    initial_value: '-1.0'
+
+  - id: move_ticks
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_h
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: stall_ticks
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # predkosc biurka, cm/s, wygladzona
+  - id: speed
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: prev_h
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  # ile cykli 50 ms biurko stoi nieruchomo po zakonczeniu jazdy
+  - id: settle
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # ostatni cel, zachowany do ewentualnego dociagniecia
+  - id: hold_target
+    type: float
+    restore_value: no
+    initial_value: '-1.0'
+
+  - id: retry_done
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+# -------------------------------------------------------------
+#  Wyslanie komendy z automatycznym wybudzeniem
+#  key   - kod klawisza
+#  ticks - ile cykli 10 ms trzymac
+# -------------------------------------------------------------
+script:
+  - id: desk_send
+    parameters:
+      key: int
+      ticks: int
+    then:
+      - lambda: |-
+          uint8_t k = (uint8_t) key;
+          if (id(idle_ticks) > 800) {          // ponad 8 s ciszy = spi
+            id(inject_key) = k;
+            id(inject_left) = 4;               // 40 ms impulsu budzacego
+            id(wake_gap) = 12;                 // 120 ms przerwy
+            id(pend_key) = k;
+            id(pend_left) = ticks;
+            ESP_LOGD("desk", "wybudzanie przed komenda 0x%02X", k);
+          } else {
+            id(inject_key) = k;
+            id(inject_left) = ticks;
+          }
+          id(idle_ticks) = 0;
+
+# -------------------------------------------------------------
+#  Przelot UART + dekodowanie wysokosci + silnik injekcji
+# -------------------------------------------------------------
+interval:
+  - interval: 10ms
+    then:
+      - lambda: |-
+          static const uint8_t SEG[10] = {
+            0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+          };
+
+          // ---- panel -> skrzynka ----
+          {
+            uint8_t tmp[64];
+            int n = 0;
+            while (id(uart_box).available() && n < 64) {
+              id(uart_box).read_byte(&tmp[n]);
+              n++;
+            }
+            if (n > 0 && id(inject_left) <= 0) {
+              id(uart_box).write_array(tmp, n);
+            }
+          }
+
+          if (id(inject_left) > 0) {
+            uint8_t k = id(inject_key);
+            uint8_t frame[5] = {0xA5, 0x00, k, (uint8_t)(~k), 0xFF};
+            id(uart_box).write_array(frame, 5);
+            id(inject_left)--;
+            if (id(inject_left) == 0) id(inject_key) = 0;
+            id(idle_ticks) = 0;
+          } else if (id(wake_gap) > 0) {
+            // cisza po impulsie budzacym
+            id(wake_gap)--;
+            if (id(wake_gap) == 0 && id(pend_left) > 0) {
+              id(inject_key) = id(pend_key);
+              id(inject_left) = id(pend_left);
+              id(pend_left) = 0;
+            }
+          } else {
+            if (id(idle_ticks) < 100000) id(idle_ticks)++;
+          }
+
+          // ---- skrzynka -> panel ----
+          auto &buf = id(rx_buf);
+          {
+            uint8_t tmp[64];
+            int n = 0;
+            while (id(uart_display).available() && n < 64) {
+              id(uart_display).read_byte(&tmp[n]);
+              n++;
+            }
+            if (n > 0) {
+              id(uart_display).write_array(tmp, n);
+              for (int j = 0; j < n; j++) buf.push_back(tmp[j]);
+            }
+          }
+          if (buf.size() > 192) {
+            buf.erase(buf.begin(), buf.end() - 96);
+          }
+
+          // ---- parsowanie ramek ----
+          size_t i = 0;
+          bool got = false;
+          float value = 0.0f;
+
+          while (buf.size() >= i + 6) {
+            if (buf[i] != 0x5A) { i++; continue; }
+
+            uint8_t d1 = buf[i + 1];
+            uint8_t d2 = buf[i + 2];
+            uint8_t d3 = buf[i + 3];
+            uint8_t tail = buf[i + 4];
+            uint8_t chk = buf[i + 5];
+
+            if (((d1 + d2 + d3 + tail) & 0xFF) != chk) { i++; continue; }
+
+            int digits[3];
+            int dot = -1;
+            bool ok = true;
+            uint8_t raw[3] = {d1, d2, d3};
+
+            for (int k = 0; k < 3; k++) {
+              if (raw[k] & 0x80) dot = k;
+              uint8_t seg = raw[k] & 0x7F;
+              digits[k] = -1;
+              for (int d = 0; d < 10; d++) {
+                if (SEG[d] == seg) { digits[k] = d; break; }
+              }
+              if (digits[k] < 0) { ok = false; break; }
+            }
+
+            if (ok) {
+              value = digits[0] * 100.0f + digits[1] * 10.0f + digits[2];
+              if (dot == 1) value /= 10.0f;
+              got = true;
+            }
+            i += 6;
+          }
+
+          if (i > 0) {
+            buf.erase(buf.begin(), buf.begin() + i);
+          }
+
+          if (got && value > 40.0f && value < 200.0f) {
+            id(height_val) = value;
+          }
+
+  # -----------------------------------------------------------
+  #  Petla regulacji, co 50 ms
+  # -----------------------------------------------------------
+  - interval: 50ms
+    then:
+      - lambda: |-
+          const float LEAD_UP = 0.445f;  // wyprzedzenie hamowania w gore, s
+          const float LEAD_DN = 0.42f;   // wyprzedzenie hamowania w dol, s
+          // Powyzej 100 cm wyswietlacz jest trzycyfrowy i gubi czesc
+          // dziesietna, wiec odczyt ma rozdzielczosc 1 cm zamiast 0,1.
+          const float TOL_FINE = 0.25f;  // ponizej 100 cm
+          const float TOL_COARSE = 0.6f; // powyzej 100 cm
+          const int MAX_TICKS = 800;     // 40 s jazdy max
+          const int STALL_MAX = 60;      // 3 s bez ruchu = blokada
+          const int SETTLE_MIN = 20;     // 1 s spokoju = biurko stoi
+          const float RETRY_ERR = 0.6f;  // powyzej tego bledu dociagamy
+
+          float h = id(height_val);
+
+          // predkosc, wygladzona wykladniczo
+          if (h > 0.0f && id(prev_h) > 0.0f) {
+            float v = (h - id(prev_h)) / 0.05f;
+            // Powyzej 100 cm odczyt skacze o caly centymetr naraz, co daje
+            // pozorna predkosc rzedu 20 cm/s. Biurko fizycznie nie jedzie
+            // szybciej niz ~3 cm/s, wiec obcinamy artefakty pomiaru.
+            if (v > 4.0f) v = 4.0f;
+            if (v < -4.0f) v = -4.0f;
+            id(speed) = 0.7f * id(speed) + 0.3f * v;
+          }
+          id(prev_h) = h;
+
+          float sp = id(speed) < 0.0f ? -id(speed) : id(speed);
+
+          // czekaj, jesli trwa sekwencja budzenia
+          if (id(wake_gap) > 0) return;
+
+          float t = id(target_h);
+
+          // =========== BIURKO BEZ CELU ===========
+          if (t < 0.0f || h <= 0.0f) {
+            id(move_ticks) = 0;
+            id(stall_ticks) = 0;
+
+            // dopoki cokolwiek sie rusza, nic nie publikuj -
+            // inaczej suwak skacze przez caly czas wybiegu
+            if (sp > 0.05f || h <= 0.0f) {
+              id(settle) = 0;
+              return;
+            }
+
+            id(settle)++;
+
+            // biurko wlasnie sie uspokoilo
+            if (id(settle) == SETTLE_MIN) {
+              id(speed) = 0.0f;
+
+              // jednorazowe dociagniecie, jesli pudlo bylo duze
+              if (id(hold_target) > 0.0f && id(retry_done) == 0) {
+                float e = id(hold_target) - h;
+                float ae = e < 0.0f ? -e : e;
+                if (ae > RETRY_ERR) {
+                  id(retry_done) = 1;
+                  id(target_h) = id(hold_target);
+                  id(last_h) = h;
+                  ESP_LOGI("desk", "dociaganie: %.1f -> %.1f", h, id(hold_target));
+                  return;
+                }
+              }
+              id(hold_target) = -1.0f;
+            }
+
+            // stoi spokojnie - suwak sledzi rzeczywista wysokosc
+            if (id(settle) >= SETTLE_MIN) {
+              float sv = id(desk_target).state;
+              if (isnan(sv) || sv < h - 0.05f || sv > h + 0.05f) {
+                id(desk_target).publish_state(h);
+              }
+            }
+            return;
+          }
+
+          // =========== JAZDA DO CELU ===========
+          id(settle) = 0;
+
+          float diff = t - h;
+          float adiff = diff < 0.0f ? -diff : diff;
+
+          float lead = (diff > 0.0f) ? LEAD_UP : LEAD_DN;
+          float tol = (h >= 99.5f) ? TOL_COARSE : TOL_FINE;
+          float margin = tol + sp * lead;
+          // twardy sufit, zeby zaden artefakt pomiaru nie zatrzymal
+          // jazdy kilka centymetrow przed celem
+          if (margin > 1.2f) margin = 1.2f;
+
+          if (adiff <= margin) {
+            id(hold_target) = t;
+            id(target_h) = -1.0f;
+            id(inject_key) = 0x00;
+            id(inject_left) = 0;
+            id(move_ticks) = 0;
+            id(stall_ticks) = 0;
+            ESP_LOGI("desk", "stop na %.1f cm, cel %.1f, predkosc %.1f cm/s",
+                     h, t, sp);
+            return;
+          }
+
+          id(move_ticks)++;
+          if (id(move_ticks) > MAX_TICKS) {
+            id(target_h) = -1.0f;
+            id(hold_target) = -1.0f;
+            id(inject_key) = 0x00;
+            id(inject_left) = 0;
+            ESP_LOGW("desk", "przerwano: przekroczony czas jazdy");
+            return;
+          }
+
+          if (h > id(last_h) - 0.05f && h < id(last_h) + 0.05f) {
+            id(stall_ticks)++;
+          } else {
+            id(stall_ticks) = 0;
+          }
+          id(last_h) = h;
+
+          if (id(stall_ticks) > STALL_MAX) {
+            id(target_h) = -1.0f;
+            id(hold_target) = -1.0f;
+            id(inject_key) = 0x00;
+            id(inject_left) = 0;
+            ESP_LOGW("desk", "przerwano: biurko nie jedzie");
+            return;
+          }
+
+          // odswiez komende jazdy na kolejne 80 ms
+          id(inject_key) = (diff > 0.0f) ? 0x20 : 0x40;
+          id(inject_left) = 8;
+          id(idle_ticks) = 0;
+
+binary_sensor:
+  - platform: template
+    name: "Biurko w ruchu"
+    id: desk_moving
+    device_class: moving
+    lambda: |-
+      float sp = id(speed) < 0.0f ? -id(speed) : id(speed);
+      return id(target_h) >= 0.0f || id(inject_left) > 0 || sp > 0.15f;
+
+sensor:
+  - platform: template
+    name: "Wysokosc biurka"
+    id: desk_height
+    unit_of_measurement: "cm"
+    accuracy_decimals: 1
+    device_class: distance
+    state_class: measurement
+    update_interval: 1s
+    filters:
+      - delta: 0.05
+    lambda: |-
+      if (id(height_val) <= 0.0f) return {};
+      return id(height_val);
+
+number:
+  - platform: template
+    name: "Docelowa wysokosc"
+    id: desk_target
+    unit_of_measurement: "cm"
+    min_value: 70
+    max_value: 115
+    step: 0.1
+    optimistic: true
+    mode: slider
+    set_action:
+      - lambda: |-
+          float h = id(height_val);
+
+          // Powyzej 100 cm biurko raportuje tylko pelne centymetry,
+          // wiec zaokraglij cel i odbij zaokraglona wartosc na suwak.
+          if (x >= 100.0f) {
+            x = roundf(x);
+            id(desk_target).publish_state(x);
+          }
+
+          id(target_h) = x;
+          id(hold_target) = -1.0f;
+          id(retry_done) = 0;
+          id(settle) = 0;
+          id(move_ticks) = 0;
+          id(stall_ticks) = 0;
+          id(last_h) = h;
+          id(speed) = 0.0f;
+
+          // jesli sterownik spi, wyslij impuls budzacy
+          // w kierunku, w ktorym i tak pojedziemy
+          if (id(idle_ticks) > 800 && h > 0.0f) {
+            uint8_t k = (x > h) ? 0x20 : 0x40;
+            id(inject_key) = k;
+            id(inject_left) = 4;
+            id(wake_gap) = 12;
+            id(idle_ticks) = 0;
+            ESP_LOGD("desk", "wybudzanie przed jazda do %.1f", x);
+          }
+          ESP_LOGI("desk", "nowy cel: %.1f cm (teraz %.1f)", x, h);
+
+button:
+  - platform: template
+    name: "Biurko stop"
+    on_press:
+      - lambda: |-
+          id(target_h) = -1.0f;
+          id(inject_key) = 0x00;
+          id(inject_left) = 0;
+          id(wake_gap) = 0;
+          id(pend_left) = 0;
+
+  - platform: template
+    name: "Biurko preset 1"
+    on_press:
+      - lambda: id(target_h) = -1.0f;
+      - script.execute:
+          id: desk_send
+          key: 0x02
+          ticks: 50
+
+  - platform: template
+    name: "Biurko preset 2"
+    on_press:
+      - lambda: id(target_h) = -1.0f;
+      - script.execute:
+          id: desk_send
+          key: 0x04
+          ticks: 50
+
+  - platform: template
+    name: "Biurko preset 3"
+    on_press:
+      - lambda: id(target_h) = -1.0f;
+      - script.execute:
+          id: desk_send
+          key: 0x08
+          ticks: 50
+
+switch:
+  - platform: template
+    name: "Biurko w gore"
+    optimistic: true
+    turn_on_action:
+      - lambda: id(target_h) = -1.0f;
+      - script.execute:
+          id: desk_send
+          key: 0x20
+          ticks: 1000000
+    turn_off_action:
+      - lambda: |-
+          id(inject_key) = 0x00;
+          id(inject_left) = 0;
+          id(pend_left) = 0;
+
+  - platform: template
+    name: "Biurko w dol"
+    optimistic: true
+    turn_on_action:
+      - lambda: id(target_h) = -1.0f;
+      - script.execute:
+          id: desk_send
+          key: 0x40
+          ticks: 1000000
+    turn_off_action:
+      - lambda: |-
+          id(inject_key) = 0x00;
+          id(inject_left) = 0;
+          id(pend_left) = 0;
+
+text_sensor:
+  - platform: openthread_info
+    role:
+      name: "Thread Role"
+    ip_address:
+      name: "Thread IP"
+
